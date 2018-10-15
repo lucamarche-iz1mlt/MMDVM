@@ -82,7 +82,5 @@
 // Use the D-Star and DMR LEDs for POCSAG
 // #define USE_ALTERNATE_POCSAG_LEDS
 
-// Select BOXCAR Filter into D-Star
-// #define DSTARBOXCAR
-
 #endif
+

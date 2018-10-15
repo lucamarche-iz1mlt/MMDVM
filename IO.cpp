@@ -49,11 +49,10 @@ static q15_t NXDN_ISINC_FILTER[] = {7616, -1333, -1856, -2611, -3399, -4006, -42
                                     9665, 8832, 7276, 5200, 2867, 561, -1458, -2988, -3918, -4230, -4006, -3399, -2611, -1856, -1333, 7616};
 const uint16_t NXDN_ISINC_FILTER_LEN = 32U;
 
-#if !defined (DSTARBOXCAR)
 // Generated using gaussfir(0.5, 4, 10) in MATLAB
 static q15_t   GAUSSIAN_0_5_FILTER[] = {1, 4, 15, 52, 151, 380, 832, 1579, 2599, 3710, 4594, 4933, 4594, 3710, 2599, 1579, 832, 380, 151, 52, 15, 4, 1, 0};
 const uint16_t GAUSSIAN_0_5_FILTER_LEN = 24U;
-#endif
+
 // One symbol boxcar filter
 static q15_t   BOXCAR_FILTER[] = {6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000, 0, 0};
 const uint16_t BOXCAR_FILTER_LEN = 12U;
@@ -68,16 +67,12 @@ m_rssiBuffer(RX_RINGBUFFER_SIZE),
 m_dcFilter(),
 m_dcState(),
 m_rrcFilter(),
-#if !defined (DSTARBOXCAR)
 m_gaussianFilter(),
-#endif
 m_boxcarFilter(),
 m_nxdnFilter(),
 m_nxdnISincFilter(),
 m_rrcState(),
-#if !defined (DSTARBOXCAR)
 m_gaussianState(),
-#endif
 m_boxcarState(),
 m_nxdnState(),
 m_nxdnISincState(),
@@ -101,9 +96,7 @@ m_watchdog(0U),
 m_lockout(false)
 {
   ::memset(m_rrcState,      	0x00U,  140U * sizeof(q15_t));
-#if !defined (DSTARBOXCAR)
   ::memset(m_gaussianState, 	0x00U,   80U * sizeof(q15_t));
-#endif
   ::memset(m_boxcarState,   	0x00U,   60U * sizeof(q15_t));
   ::memset(m_nxdnState,     	0x00U, 	220U * sizeof(q15_t));
   ::memset(m_nxdnISincState, 	0x00U, 	 60U * sizeof(q15_t));
@@ -117,11 +110,11 @@ m_lockout(false)
   m_rrcFilter.numTaps = RRC_0_2_FILTER_LEN;
   m_rrcFilter.pState  = m_rrcState;
   m_rrcFilter.pCoeffs = RRC_0_2_FILTER;
-#if !defined (DSTARBOXCAR)
+
   m_gaussianFilter.numTaps = GAUSSIAN_0_5_FILTER_LEN;
   m_gaussianFilter.pState  = m_gaussianState;
   m_gaussianFilter.pCoeffs = GAUSSIAN_0_5_FILTER;
-#endif
+
   m_boxcarFilter.numTaps = BOXCAR_FILTER_LEN;
   m_boxcarFilter.pState  = m_boxcarState;
   m_boxcarFilter.pCoeffs = BOXCAR_FILTER;
@@ -149,7 +142,7 @@ void CIO::selfTest()
     // We exclude PTT to avoid trigger the transmitter
     setLEDInt(ledValue);
     setCOSInt(ledValue);
-#if defined(MODE_PINS)
+#if defined(MODE_LEDS)
     setDStarInt(ledValue);
     setDMRInt(ledValue);
     setYSFInt(ledValue);
@@ -160,7 +153,7 @@ void CIO::selfTest()
     delayInt(250);
   }
 
-#if defined(MODE_PINS)
+#if defined(MODE_LEDS)
   setDStarInt(true);
   setDMRInt(false);
   setYSFInt(false);
@@ -287,7 +280,7 @@ void CIO::process()
   if (m_started) {
     // Two seconds timeout
     if (m_watchdog >= 96000U) {
-      if (m_modemState == STATE_DSTAR || m_modemState == STATE_DMR || m_modemState == STATE_YSF || m_modemState == STATE_P25 || m_modemState == STATE_NXDN) {
+      if (m_modemState == STATE_DSTAR || m_modemState == STATE_DMR || m_modemState == STATE_YSF || m_modemState == STATE_P25 || m_modemState == STATE_NXDN || m_modemState == STATE_POCSAG) {
         if (m_modemState == STATE_DMR && m_tx)
           dmrTX.setStart(false);
         m_modemState = STATE_IDLE;
@@ -370,17 +363,9 @@ void CIO::process()
       if (m_dstarEnable) {
         q15_t GMSKVals[RX_BLOCK_SIZE];
 #if defined(USE_DCBLOCKER)
-	#if !defined (DSTARBOXCAR)
         ::arm_fir_fast_q15(&m_gaussianFilter, dcSamples, GMSKVals, RX_BLOCK_SIZE);
-    #else
-        ::arm_fir_fast_q15(&m_boxcarFilter, dcSamples, GMSKVals, RX_BLOCK_SIZE);
-	#endif
 #else
-	#if !defined (DSTARBOXCAR)
-    	::arm_fir_fast_q15(&m_gaussianFilter, samples, GMSKVals, RX_BLOCK_SIZE);
-	#else
-    	::arm_fir_fast_q15(&m_boxcarFilter, samples, GMSKVals, RX_BLOCK_SIZE);
-	#endif
+        ::arm_fir_fast_q15(&m_gaussianFilter, samples, GMSKVals, RX_BLOCK_SIZE);
 #endif
         dstarRX.samples(GMSKVals, rssi, RX_BLOCK_SIZE);
       }
@@ -426,17 +411,9 @@ void CIO::process()
       if (m_dstarEnable) {
         q15_t GMSKVals[RX_BLOCK_SIZE];
 #if defined(USE_DCBLOCKER)
-	#if !defined (DSTARBOXCAR)
         ::arm_fir_fast_q15(&m_gaussianFilter, dcSamples, GMSKVals, RX_BLOCK_SIZE);
-	#else
-        ::arm_fir_fast_q15(&m_boxcarFilter, dcSamples, GMSKVals, RX_BLOCK_SIZE);
-	#endif
 #else
-	#if !defined (DSTARBOXCAR)
-		::arm_fir_fast_q15(&m_gaussianFilter, samples, GMSKVals, RX_BLOCK_SIZE);
-	#else
-		::arm_fir_fast_q15(&m_boxcarFilter, samples, GMSKVals, RX_BLOCK_SIZE);
-	#endif
+        ::arm_fir_fast_q15(&m_gaussianFilter, samples, GMSKVals, RX_BLOCK_SIZE);
 #endif
         dstarRX.samples(GMSKVals, rssi, RX_BLOCK_SIZE);
       }
@@ -490,11 +467,8 @@ void CIO::process()
       }
     } else if (m_modemState == STATE_DSTARCAL) {
       q15_t GMSKVals[RX_BLOCK_SIZE];
-#if !defined (DSTARBOXCAR)
-    	::arm_fir_fast_q15(&m_gaussianFilter, samples, GMSKVals, RX_BLOCK_SIZE);
-#else
-    	::arm_fir_fast_q15(&m_boxcarFilter, samples, GMSKVals, RX_BLOCK_SIZE);
-#endif
+      ::arm_fir_fast_q15(&m_gaussianFilter, samples, GMSKVals, RX_BLOCK_SIZE);
+
       calDStarRX.samples(GMSKVals, RX_BLOCK_SIZE);
     } else if (m_modemState == STATE_RSSICAL) {
       calRSSI.samples(rssi, RX_BLOCK_SIZE);
@@ -577,7 +551,7 @@ void CIO::setADCDetection(bool detect)
 
 void CIO::setMode()
 {
-#if defined(MODE_PINS)
+#if defined(MODE_LEDS)
   setDStarInt(m_modemState == STATE_DSTAR);
   setDMRInt(m_modemState   == STATE_DMR);
   setYSFInt(m_modemState   == STATE_YSF);
