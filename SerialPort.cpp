@@ -71,6 +71,7 @@ const uint8_t MMDVM_NAK          = 0x7FU;
 const uint8_t MMDVM_SERIAL       = 0x80U;
 
 const uint8_t MMDVM_TRANSPARENT  = 0x90U;
+const uint8_t MMDVM_QSO_INFO     = 0x91U;
 
 const uint8_t MMDVM_DEBUG1       = 0xF1U;
 const uint8_t MMDVM_DEBUG2       = 0xF2U;
@@ -90,14 +91,20 @@ const uint8_t MMDVM_DEBUG5       = 0xF5U;
 #define TCXO "NO TCXO"
 #endif
 
-#define DESCRIPTION              "MMDVM 20180723 (D-Star/DMR/System Fusion/P25/NXDN/POCSAG)"
+#if defined(STM32F4_RPT_HAT_TGO)
+#define HW_TYPE "MMDVM_RPT_HAT_TGO"
+#else
+#define HW_TYPE "MMDVM"
+#endif
+
+#define DESCRIPTION "20180723 (D-Star/DMR/System Fusion/P25/NXDN/POCSAG)"
 
 #if defined(GITVERSION)
-#define concat(a, b, c) a " " b " GitID #" c ""
-const char HARDWARE[] = concat(DESCRIPTION, TCXO, GITVERSION);
+#define concat(h, a, b, c) h " " a " " b " GitID #" c ""
+const char HARDWARE[] = concat(HW_TYPE, DESCRIPTION, TCXO, GITVERSION);
 #else
-#define concat(a, b, c, d) a " " b " (Build: " c " " d ")"
-const char HARDWARE[] = concat(DESCRIPTION, TCXO, __TIME__, __DATE__);
+#define concat(h, a, b, c, d) h " " a " " b " (Build: " c " " d ")"
+const char HARDWARE[] = concat(HW_TYPE, DESCRIPTION, TCXO, __TIME__, __DATE__);
 #endif
 
 const uint8_t PROTOCOL_VERSION   = 1U;
@@ -814,6 +821,7 @@ void CSerialPort::process()
             break;
 
           case MMDVM_TRANSPARENT:
+          case MMDVM_QSO_INFO:
             // Do nothing on the MMDVM.
             break;
 
