@@ -71,6 +71,7 @@ const uint8_t MMDVM_NAK          = 0x7FU;
 const uint8_t MMDVM_SERIAL       = 0x80U;
 
 const uint8_t MMDVM_TRANSPARENT  = 0x90U;
+const uint8_t MMDVM_QSO_INFO     = 0x91U;
 
 const uint8_t MMDVM_DEBUG1       = 0xF1U;
 const uint8_t MMDVM_DEBUG2       = 0xF2U;
@@ -96,7 +97,7 @@ const uint8_t MMDVM_DEBUG5       = 0xF5U;
 #define HW_TYPE "MMDVM"
 #endif
 
-#define DESCRIPTION "201801010-48k (D-Star/DMR/System Fusion/P25/NXDN/POCSAG)"
+#define DESCRIPTION "20181112-48k (D-Star/DMR/System Fusion/P25/NXDN/POCSAG)"
 
 #if defined(GITVERSION)
 #define concat(h, a, b, c) h " " a " " b " GitID #" c ""
@@ -820,6 +821,7 @@ void CSerialPort::process()
             break;
 
           case MMDVM_TRANSPARENT:
+          case MMDVM_QSO_INFO:
             // Do nothing on the MMDVM.
             break;
 
