@@ -92,12 +92,12 @@ const uint8_t MMDVM_DEBUG5       = 0xF5U;
 #endif
 
 #if defined(STM32F4_RPT_HAT_TGO)
-#define HW_TYPE "MMDVM_RPT_HAT_TGO-48khz"
+#define HW_TYPE "MMDVM_RPT_HAT_TGO 48khz"
 #else
-#define HW_TYPE "MMDVM-48Khz"
+#define HW_TYPE "MMDVM 48Khz"
 #endif
 
-#define DESCRIPTION "20190130 (D-Star/DMR/System Fusion/P25/NXDN/POCSAG)"
+#define DESCRIPTION "20190202 (D-Star/DMR/System Fusion/P25/NXDN/POCSAG)"
 
 #if defined(GITVERSION)
 #define concat(h, a, b, c) h " " a " " b " GitID #" c ""
