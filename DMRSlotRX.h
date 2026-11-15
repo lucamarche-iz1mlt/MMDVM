@@ -66,9 +66,12 @@ private:
   uint8_t     m_n;
   uint8_t     m_type;
   uint16_t    m_rssi[900U];
+  int16_t     m_delta;
 
   void correlateSync(bool first);
-  void samplesToBits(uint16_t start, uint8_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold);
+  q15_t sampleAt(uint16_t pos, int16_t delta) const;
+  int16_t syncDelta(bool data) const;
+  void samplesToBits(uint16_t start, uint8_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold, int16_t delta = 0);
   void writeRSSIData(uint8_t* frame);
 };
 

@@ -60,7 +60,8 @@ m_colorCode(0U),
 m_state(DMORXS_NONE),
 m_n(0U),
 m_type(0U),
-m_rssi()
+m_rssi(),
+m_delta(0)
 {
 }
 
@@ -73,6 +74,7 @@ void CDMRDMORX::reset()
   m_state     = DMORXS_NONE;
   m_startPtr  = 0U;
   m_endPtr    = NOENDPTR;
+  m_delta     = 0;
 }
 
 void CDMRDMORX::samples(const q15_t* samples, const uint16_t* rssi, uint8_t length)
@@ -123,11 +125,17 @@ bool CDMRDMORX::processSample(q15_t sample, uint16_t rssi)
     uint8_t frame[DMR_FRAME_LENGTH_BYTES + 3U];
     frame[0U] = m_control;
 
-    uint16_t ptr = m_endPtr + DMO_BUFFER_LENGTH_SAMPLES - DMR_FRAME_LENGTH_SAMPLES + DMR_RADIO_SYMBOL_LENGTH + 1U;
+    // Sub-sample position of the sync, used to interpolate the symbol samples of this and the following frames
+    if (m_control == CONTROL_DATA)
+      m_delta = syncDelta(true);
+    else if (m_control == CONTROL_VOICE)
+      m_delta = syncDelta(false);
+
+    uint16_t ptr = m_startPtr + DMR_RADIO_SYMBOL_LENGTH;
     if (ptr >= DMO_BUFFER_LENGTH_SAMPLES)
       ptr -= DMO_BUFFER_LENGTH_SAMPLES;
 
-    samplesToBits(ptr, DMR_FRAME_LENGTH_SYMBOLS, frame, 8U, centre, threshold);
+    samplesToBits(ptr, DMR_FRAME_LENGTH_SYMBOLS, frame, 8U, centre, threshold, m_delta);
 
     if (m_control == CONTROL_DATA) {
       // Data sync
@@ -324,7 +332,7 @@ void CDMRDMORX::correlateSync(bool first)
           if (m_startPtr >= DMO_BUFFER_LENGTH_SAMPLES)
             m_startPtr -= DMO_BUFFER_LENGTH_SAMPLES;
 
-          m_endPtr = m_dataPtr + DMR_SLOT_TYPE_LENGTH_SAMPLES / 2U + DMR_INFO_LENGTH_SAMPLES / 2U - 1U;
+          m_endPtr = m_dataPtr + DMR_SLOT_TYPE_LENGTH_SAMPLES / 2U + DMR_INFO_LENGTH_SAMPLES / 2U + 1U;
           if (m_endPtr >= DMO_BUFFER_LENGTH_SAMPLES)
             m_endPtr -= DMO_BUFFER_LENGTH_SAMPLES;
         }
@@ -355,7 +363,7 @@ void CDMRDMORX::correlateSync(bool first)
           if (m_startPtr >= DMO_BUFFER_LENGTH_SAMPLES)
             m_startPtr -= DMO_BUFFER_LENGTH_SAMPLES;
 
-          m_endPtr   = m_dataPtr + DMR_SLOT_TYPE_LENGTH_SAMPLES / 2U + DMR_INFO_LENGTH_SAMPLES / 2U - 1U;
+          m_endPtr   = m_dataPtr + DMR_SLOT_TYPE_LENGTH_SAMPLES / 2U + DMR_INFO_LENGTH_SAMPLES / 2U + 1U;
           if (m_endPtr >= DMO_BUFFER_LENGTH_SAMPLES)
             m_endPtr -= DMO_BUFFER_LENGTH_SAMPLES;
         }
@@ -364,10 +372,88 @@ void CDMRDMORX::correlateSync(bool first)
   }
 }
 
-void CDMRDMORX::samplesToBits(uint16_t start, uint8_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold)
+// Value of the waveform at buffer position pos + delta/256 samples (|delta| <= 128),
+// by quadratic (3 point Lagrange) interpolation. delta == 0 returns the stored sample.
+q15_t CDMRDMORX::sampleAt(uint16_t pos, int16_t delta) const
+{
+  if (delta == 0)
+    return m_buffer[pos];
+
+  uint16_t prev = (pos == 0U) ? DMO_BUFFER_LENGTH_SAMPLES - 1U : pos - 1U;
+  uint16_t next = (pos + 1U >= DMO_BUFFER_LENGTH_SAMPLES) ? 0U : pos + 1U;
+
+  q31_t s0 = m_buffer[pos];
+  q31_t sm = m_buffer[prev];
+  q31_t sp = m_buffer[next];
+
+  q31_t d = delta;
+  q31_t v = s0 + ((d * (sp - sm)) >> 9) + (((d * d) * (sp - 2 * s0 + sm)) >> 17);
+
+  if (v > 32767)
+    v = 32767;
+  if (v < -32768)
+    v = -32768;
+
+  return q15_t(v);
+}
+
+// Sub-sample position (1/256 sample units, -128..+128) of the sync correlation peak
+// relative to m_syncPtr, from a parabola through the correlation at -1, 0 and +1 samples.
+int16_t CDMRDMORX::syncDelta(bool data) const
+{
+  const int8_t* values = data ? DMR_MS_DATA_SYNC_SYMBOLS_VALUES : DMR_MS_VOICE_SYNC_SYMBOLS_VALUES;
+
+  q31_t c[3U];
+  for (uint8_t d = 0U; d < 3U; d++) {
+    uint16_t ptr = m_syncPtr + DMO_BUFFER_LENGTH_SAMPLES - DMR_SYNC_LENGTH_SAMPLES + DMR_RADIO_SYMBOL_LENGTH + d - 1U;
+    if (ptr >= DMO_BUFFER_LENGTH_SAMPLES)
+      ptr -= DMO_BUFFER_LENGTH_SAMPLES;
+
+    q31_t corr = 0;
+    for (uint8_t i = 0U; i < DMR_SYNC_LENGTH_SYMBOLS; i++) {
+      q15_t val = m_buffer[ptr];
+
+      switch (values[i]) {
+      case +3:
+        corr -= (val + val + val);
+        break;
+      case +1:
+        corr -= val;
+        break;
+      case -1:
+        corr += val;
+        break;
+      default:  // -3
+        corr += (val + val + val);
+        break;
+      }
+
+      ptr += DMR_RADIO_SYMBOL_LENGTH;
+      if (ptr >= DMO_BUFFER_LENGTH_SAMPLES)
+        ptr -= DMO_BUFFER_LENGTH_SAMPLES;
+    }
+
+    c[d] = corr;
+  }
+
+  // Not a clear peak, don't interpolate
+  q31_t den = c[0U] - 2 * c[1U] + c[2U];
+  if (c[1U] < c[0U] || c[1U] < c[2U] || den >= 0)
+    return 0;
+
+  q31_t p = ((c[0U] - c[2U]) << 7) / den;
+  if (p > 128)
+    p = 128;
+  if (p < -128)
+    p = -128;
+
+  return int16_t(p);
+}
+
+void CDMRDMORX::samplesToBits(uint16_t start, uint8_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold, int16_t delta)
 {
   for (uint8_t i = 0U; i < count; i++) {
-    q15_t sample = m_buffer[start] - centre;
+    q15_t sample = sampleAt(start, delta) - centre;
 
     if (sample < -threshold) {
       WRITE_BIT1(buffer, offset, false);
