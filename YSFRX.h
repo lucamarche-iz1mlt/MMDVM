@@ -52,19 +52,21 @@ private:
   q31_t       m_maxCorr;
   uint16_t    m_lostCount;
   uint8_t     m_countdown;
-  q15_t       m_centre[16U];
   q15_t       m_centreVal;
-  q15_t       m_threshold[16U];
   q15_t       m_thresholdVal;
   uint8_t     m_averagePtr;
   uint32_t    m_rssiAccum;
   uint16_t    m_rssiCount;
+  int16_t     m_delta;
 
   void processNone(q15_t sample);
   void processData(q15_t sample);
   bool correlateSync();
-  void calculateLevels(uint16_t start, uint16_t count);
-  void samplesToBits(uint16_t start, uint16_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold);
+  q15_t sampleAt(uint16_t pos, int16_t delta) const;
+  q31_t syncCorrelation(int8_t offset) const;
+  void alignSync();
+  void syncLevels();
+  void samplesToBits(uint16_t start, uint16_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold, int16_t delta = 0);
   void writeRSSIData(uint8_t* data);
 };
 

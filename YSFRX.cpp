@@ -24,8 +24,6 @@
 #include "YSFRX.h"
 #include "Utils.h"
 
-const q15_t SCALING_FACTOR = 18750;      // Q15(0.55)
-
 const uint8_t MAX_SYNC_BIT_START_ERRS = 2U;
 const uint8_t MAX_SYNC_BIT_RUN_ERRS   = 4U;
 
@@ -55,13 +53,12 @@ m_maxSyncPtr(NOENDPTR),
 m_maxCorr(0),
 m_lostCount(0U),
 m_countdown(0U),
-m_centre(),
 m_centreVal(0),
-m_threshold(),
 m_thresholdVal(0),
 m_averagePtr(NOAVEPTR),
 m_rssiAccum(0U),
-m_rssiCount(0U)
+m_rssiCount(0U),
+m_delta(0)
 {
 }
 
@@ -83,6 +80,7 @@ void CYSFRX::reset()
   m_countdown    = 0U;
   m_rssiAccum    = 0U;
   m_rssiCount    = 0U;
+  m_delta        = 0;
 }
 
 void CYSFRX::samples(const q15_t* samples, uint16_t* rssi, uint8_t length)
@@ -164,8 +162,11 @@ void CYSFRX::processData(q15_t sample)
   }
 
   if (m_dataPtr == m_endPtr) {
-    // Only update the centre and threshold if they are from a good sync
+    // Only update the position, centre and threshold if they are from a good sync
     if (m_lostCount == MAX_SYNC_FRAMES) {
+      alignSync();
+      syncLevels();
+
       m_minSyncPtr = m_syncPtr + YSF_FRAME_LENGTH_SAMPLES - 1U;
       if (m_minSyncPtr >= YSF_FRAME_LENGTH_SAMPLES)
         m_minSyncPtr -= YSF_FRAME_LENGTH_SAMPLES;
@@ -175,12 +176,10 @@ void CYSFRX::processData(q15_t sample)
         m_maxSyncPtr -= YSF_FRAME_LENGTH_SAMPLES;
     }
 
-    calculateLevels(m_startPtr, YSF_FRAME_LENGTH_SYMBOLS);
-
     DEBUG4("YSFRX: sync found pos/centre/threshold", m_syncPtr, m_centreVal, m_thresholdVal);
 
     uint8_t frame[YSF_FRAME_LENGTH_BYTES + 3U];
-    samplesToBits(m_startPtr, YSF_FRAME_LENGTH_SYMBOLS, frame, 8U, m_centreVal, m_thresholdVal);
+    samplesToBits(m_startPtr, YSF_FRAME_LENGTH_SYMBOLS, frame, 8U, m_centreVal, m_thresholdVal, m_delta);
 
     // We've not seen a data sync for too long, signal RXLOST and change to RX_NONE
     m_lostCount--;
@@ -213,16 +212,19 @@ bool CYSFRX::correlateSync()
       ptr -= YSF_FRAME_LENGTH_SAMPLES;
 
     q31_t corr = 0;
-    q15_t min =  16000;
-    q15_t max = -16000;
+    q31_t sumL  = 0;   // sum of the levels
+    q31_t sumLL = 0;   // sum of the levels squared
+    q31_t sumS  = 0;   // sum of the samples
+    q31_t sumLS = 0;   // sum of level * sample
 
     for (uint8_t i = 0U; i < YSF_SYNC_LENGTH_SYMBOLS; i++) {
       q15_t val = m_buffer[ptr];
 
-      if (val > max)
-        max = val;
-      if (val < min)
-        min = val;
+      q31_t level = -YSF_SYNC_SYMBOLS_VALUES[i];   // the received samples have the opposite sign of the symbol values
+      sumL  += level;
+      sumLL += level * level;
+      sumS  += val;
+      sumLS += level * val;
 
       switch (YSF_SYNC_SYMBOLS_VALUES[i]) {
       case +3:
@@ -246,10 +248,18 @@ bool CYSFRX::correlateSync()
 
     if (corr > m_maxCorr) {
       if (m_averagePtr == NOAVEPTR) {
-        m_centreVal = (max + min) >> 1;
+        // Centre and threshold from the known sync symbols
+        const q31_t n = YSF_SYNC_LENGTH_SYMBOLS;
 
-        q31_t v1 = (max - m_centreVal) * SCALING_FACTOR;
-        m_thresholdVal = q15_t(v1 >> 15);
+        q31_t den = n * sumLL - sumL * sumL;
+        q31_t num = n * sumLS - sumL * sumS;
+        if (den <= 0 || num <= 0)
+          return false;
+
+        q31_t gain = num / den;
+
+        m_centreVal    = q15_t((sumS - gain * sumL) / n);
+        m_thresholdVal = q15_t((2 * num) / den);
       }
 
       uint16_t startPtr = m_dataPtr + YSF_FRAME_LENGTH_SAMPLES - YSF_SYNC_LENGTH_SAMPLES + YSF_RADIO_SYMBOL_LENGTH;
@@ -276,7 +286,8 @@ bool CYSFRX::correlateSync()
 
         m_startPtr = startPtr;
 
-        m_endPtr = m_dataPtr + YSF_FRAME_LENGTH_SAMPLES - YSF_SYNC_LENGTH_SAMPLES - 1U;
+        // Two samples after the last symbol of the frame, so that it can be interpolated
+        m_endPtr = m_dataPtr + YSF_FRAME_LENGTH_SAMPLES - YSF_SYNC_LENGTH_SAMPLES + 1U;
         if (m_endPtr >= YSF_FRAME_LENGTH_SAMPLES)
           m_endPtr -= YSF_FRAME_LENGTH_SAMPLES;
 
@@ -288,74 +299,141 @@ bool CYSFRX::correlateSync()
   return false;
 }
 
-void CYSFRX::calculateLevels(uint16_t start, uint16_t count)
+q15_t CYSFRX::sampleAt(uint16_t pos, int16_t delta) const
 {
-  q15_t maxPos = -16000;
-  q15_t minPos =  16000;
-  q15_t maxNeg =  16000;
-  q15_t minNeg = -16000;
+  if (delta == 0)
+    return m_buffer[pos];
 
-  for (uint16_t i = 0U; i < count; i++) {
-    q15_t sample = m_buffer[start];
+  uint16_t prev = (pos == 0U) ? YSF_FRAME_LENGTH_SAMPLES - 1U : pos - 1U;
+  uint16_t next = (pos + 1U >= YSF_FRAME_LENGTH_SAMPLES) ? 0U : pos + 1U;
 
-    if (sample > 0) {
-      if (sample > maxPos)
-        maxPos = sample;
-      if (sample < minPos)
-        minPos = sample;
-    } else {
-      if (sample < maxNeg)
-        maxNeg = sample;
-      if (sample > minNeg)
-        minNeg = sample;
-    }
+  q31_t s0 = m_buffer[pos];
+  q31_t sm = m_buffer[prev];
+  q31_t sp = m_buffer[next];
 
-    start += YSF_RADIO_SYMBOL_LENGTH;
-    if (start >= YSF_FRAME_LENGTH_SAMPLES)
-      start -= YSF_FRAME_LENGTH_SAMPLES;
-  }
+  q31_t d = delta;
+  q31_t v = s0 + ((d * (sp - sm)) >> 9) + (((d * d) * (sp - 2 * s0 + sm)) >> 17);
 
-  q15_t posThresh = (maxPos + minPos) >> 1;
-  q15_t negThresh = (maxNeg + minNeg) >> 1;
+  if (v > 32767)
+    v = 32767;
+  if (v < -32768)
+    v = -32768;
 
-  q15_t centre = (posThresh + negThresh) >> 1;
-
-  q15_t threshold = posThresh - centre;
-
-  DEBUG5("YSFRX: pos/neg/centre/threshold", posThresh, negThresh, centre, threshold);
-
-  if (m_averagePtr == NOAVEPTR) {
-    for (uint8_t i = 0U; i < 16U; i++) {
-      m_centre[i] = centre;
-      m_threshold[i] = threshold;
-    }
-
-    m_averagePtr = 0U;
-  } else {
-    m_centre[m_averagePtr] = centre;
-    m_threshold[m_averagePtr] = threshold;
-
-    m_averagePtr++;
-    if (m_averagePtr >= 16U)
-      m_averagePtr = 0U;
-  }
-
-  m_centreVal = 0;
-  m_thresholdVal = 0;
-
-  for (uint8_t i = 0U; i < 16U; i++) {
-    m_centreVal += m_centre[i];
-    m_thresholdVal += m_threshold[i];
-  }
-
-  m_centreVal >>= 4;
-  m_thresholdVal >>= 4;
+  return q15_t(v);
 }
 
-void CYSFRX::samplesToBits(uint16_t start, uint16_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold)
+// Correlation of the sync symbols with the buffer, for a sync position shifted by offset samples
+q31_t CYSFRX::syncCorrelation(int8_t offset) const
+{
+  int32_t ptr = int32_t(m_syncPtr) + int32_t(YSF_FRAME_LENGTH_SAMPLES) - int32_t(YSF_SYNC_LENGTH_SAMPLES) + int32_t(YSF_RADIO_SYMBOL_LENGTH) + offset;
+  ptr %= int32_t(YSF_FRAME_LENGTH_SAMPLES);
+
+  q31_t corr = 0;
+  for (uint8_t i = 0U; i < YSF_SYNC_LENGTH_SYMBOLS; i++) {
+    q15_t val = m_buffer[ptr];
+
+    switch (YSF_SYNC_SYMBOLS_VALUES[i]) {
+    case +3:
+      corr -= (val + val + val);
+      break;
+    case +1:
+      corr -= val;
+      break;
+    case -1:
+      corr += val;
+      break;
+    default:  // -3
+      corr += (val + val + val);
+      break;
+    }
+
+    ptr += YSF_RADIO_SYMBOL_LENGTH;
+    if (ptr >= int32_t(YSF_FRAME_LENGTH_SAMPLES))
+      ptr -= int32_t(YSF_FRAME_LENGTH_SAMPLES);
+  }
+
+  return corr;
+}
+
+// Find the best sync position to the nearest sample, and the sub-sample position of the correlation peak
+void CYSFRX::alignSync()
+{
+  q31_t c[5U];
+  for (int8_t o = -2; o <= 2; o++)
+    c[o + 2] = syncCorrelation(o);
+
+  uint8_t best = 2U;
+  for (uint8_t i = 0U; i < 5U; i++) {
+    if (c[i] > c[best])
+      best = i;
+  }
+
+  int8_t shift = int8_t(best) - 2;
+  if (shift != 0) {
+    m_syncPtr  = uint16_t((int32_t(m_syncPtr)  + shift + int32_t(YSF_FRAME_LENGTH_SAMPLES)) % int32_t(YSF_FRAME_LENGTH_SAMPLES));
+    m_startPtr = uint16_t((int32_t(m_startPtr) + shift + int32_t(YSF_FRAME_LENGTH_SAMPLES)) % int32_t(YSF_FRAME_LENGTH_SAMPLES));
+  }
+
+  // Sub-sample position (1/256 sample units, -128..+128) from a parabola through the three correlations around the peak
+  m_delta = 0;
+  if (best >= 1U && best <= 3U) {
+    q31_t den = c[best - 1U] - 2 * c[best] + c[best + 1U];
+    if (den < 0) {
+      q31_t p = ((c[best - 1U] - c[best + 1U]) << 7) / den;
+      if (p > 128)
+        p = 128;
+      if (p < -128)
+        p = -128;
+      m_delta = int16_t(p);
+    }
+  }
+}
+
+// Centre and threshold from the known sync symbols, by a least squares fit of
+// sample = centre + gain * level over the (interpolated) sync samples. The threshold is
+// halfway between the inner (1) and outer (3) levels, i.e. twice the gain.
+void CYSFRX::syncLevels()
+{
+  uint16_t ptr = m_startPtr;
+
+  q31_t sumL  = 0;   // sum of the levels
+  q31_t sumLL = 0;   // sum of the levels squared
+  q31_t sumS  = 0;   // sum of the samples
+  q31_t sumLS = 0;   // sum of level * sample
+
+  for (uint8_t i = 0U; i < YSF_SYNC_LENGTH_SYMBOLS; i++) {
+    q31_t sample = sampleAt(ptr, m_delta);
+    q31_t level  = -YSF_SYNC_SYMBOLS_VALUES[i];   // the received samples have the opposite sign of the symbol values
+
+    sumL  += level;
+    sumLL += level * level;
+    sumS  += sample;
+    sumLS += level * sample;
+
+    ptr += YSF_RADIO_SYMBOL_LENGTH;
+    if (ptr >= YSF_FRAME_LENGTH_SAMPLES)
+      ptr -= YSF_FRAME_LENGTH_SAMPLES;
+  }
+
+  const q31_t n = YSF_SYNC_LENGTH_SYMBOLS;
+
+  q31_t den = n * sumLL - sumL * sumL;
+  q31_t num = n * sumLS - sumL * sumS;      // the gain is num / den
+  if (den <= 0 || num <= 0)
+    return;
+
+  q31_t gain = num / den;
+
+  m_centreVal    = q15_t((sumS - gain * sumL) / n);
+  m_thresholdVal = q15_t((2 * num) / den);
+
+  m_averagePtr = 0U;
+}
+
+void CYSFRX::samplesToBits(uint16_t start, uint16_t count, uint8_t* buffer, uint16_t offset, q15_t centre, q15_t threshold, int16_t delta)
 {
   for (uint16_t i = 0U; i < count; i++) {
-    q15_t sample = m_buffer[start] - centre;
+    q15_t sample = sampleAt(start, delta) - centre;
 
     if (sample < -threshold) {
       WRITE_BIT1(buffer, offset, false);
