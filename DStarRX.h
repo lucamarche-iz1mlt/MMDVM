@@ -73,9 +73,9 @@ private:
   void    samplesToBits(const q15_t* inBuffer, uint16_t start, uint16_t count, uint8_t* outBuffer, uint16_t limit);
   void    writeRSSIHeader(unsigned char* header);
   void    writeRSSIData(unsigned char* data);
-  bool    rxHeader(uint8_t* in, uint8_t* out);
+  bool    rxHeader(const q15_t* in, uint8_t* out);
   void    acs(int* metric);
-  void    viterbiDecode(int* data);
+  void    viterbiDecode(const int* data);
   void    traceBack();
   bool    checksum(const uint8_t* header) const;
 };

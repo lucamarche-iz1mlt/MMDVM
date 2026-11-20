@@ -236,6 +236,9 @@ const uint16_t CCITT_TABLE[] = {
 
 const uint16_t NOENDPTR = 9999U;
 
+// Soft metric: 0 = certain 0 bit, SOFT_MAX = certain 1 bit
+const int SOFT_MAX = 254;
+
 CDStarRX::CDStarRX() :
 m_rxState(DSRXS_NONE),
 m_bitBuffer(),
@@ -360,12 +363,10 @@ void CDStarRX::processHeader(q15_t sample)
 
   // A full FEC header
   if (m_headerPtr == (DSTAR_FEC_SECTION_LENGTH_SAMPLES + DSTAR_RADIO_SYMBOL_LENGTH)) {
-    uint8_t buffer[DSTAR_FEC_SECTION_LENGTH_BYTES];
-    samplesToBits(m_headerBuffer, DSTAR_RADIO_SYMBOL_LENGTH, DSTAR_FEC_SECTION_LENGTH_SYMBOLS, buffer, DSTAR_FEC_SECTION_LENGTH_SAMPLES);
-
-    // Process the scrambling, interleaving and FEC, then return true if the chcksum was correct
+    // Descrambling, deinterleaving and soft Viterbi work directly on the samples,
+    // then return true if the checksum was correct
     uint8_t header[DSTAR_HEADER_LENGTH_BYTES];
-    bool ok = rxHeader(buffer, header);
+    bool ok = rxHeader(m_headerBuffer, header);
     if (!ok) {
       // The checksum failed, return to looking for syncs
       m_rxState = DSRXS_NONE;
@@ -604,85 +605,68 @@ void CDStarRX::samplesToBits(const q15_t* inBuffer, uint16_t start, uint16_t cou
   }
 }
 
-bool CDStarRX::rxHeader(uint8_t* in, uint8_t* out)
+bool CDStarRX::rxHeader(const q15_t* in, uint8_t* out)
 {
-  int i;
+  // The first header symbol is at sample DSTAR_RADIO_SYMBOL_LENGTH
+  const uint16_t FIRST = DSTAR_RADIO_SYMBOL_LENGTH;
 
-  // Descramble the header
-  for (i = 0; i < int(DSTAR_FEC_SECTION_LENGTH_BYTES); i++)
-    in[i] ^= SCRAMBLE_TABLE_RX[i];
-
-  unsigned char intermediate[84U];
-  for (i = 0; i < 84; i++)
-    intermediate[i] = 0x00U;
-
-  // Deinterleave the header
-  i = 0;
-  while (i < 660) {
-    unsigned char d = in[i / 8];
-
-    if (d & 0x01U)
-      intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-    i++;
-
-    if (d & 0x02U)
-      intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-    i++;
-
-    if (d & 0x04U)
-      intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-    i++;
-
-    if (d & 0x08U)
-      intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-    i++;
-
-    if (i < 660) {
-      if (d & 0x10U)
-        intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-      i++;
-
-      if (d & 0x20U)
-        intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-      i++;
-
-      if (d & 0x40U)
-        intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-      i++;
-
-      if (d & 0x80U)
-        intermediate[INTERLEAVE_TABLE_RX[i * 2U]] |= (0x80U >> INTERLEAVE_TABLE_RX[i * 2U + 1U]);
-      i++;
-    }
+  // Mean symbol amplitude, used to normalise the soft values
+  uint32_t sum = 0U;
+  for (uint16_t i = 0U; i < 660U; i++) {
+    int32_t s = in[FIRST + i * DSTAR_RADIO_SYMBOL_LENGTH];
+    sum += (s < 0) ? -s : s;
   }
 
-  for (i = 0; i < 4; i++)
-    m_pathMetric[i] = 0;
+  int32_t amp = int32_t(sum / 660U);
+  if (amp < 1)
+    amp = 1;
+
+  // Samples -> soft values, with descrambling and deinterleaving in a single pass.
+  // soft[] is already in the order the convolutional decoder expects.
+  uint8_t soft[660U];
+  for (uint16_t i = 0U; i < 660U; i++)
+    soft[i] = SOFT_MAX / 2;
+
+  for (uint16_t i = 0U; i < 660U; i++) {
+    // 85/amp: a symbol as large as the mean maps to 85, saturating at 1.5 times the mean.
+    // This scaling is a starting point: try others (e.g. 127/amp).
+    int32_t x = (int32_t(in[FIRST + i * DSTAR_RADIO_SYMBOL_LENGTH]) * 85) / amp;
+    if (x > 127)
+      x = 127;
+    if (x < -127)
+      x = -127;
+
+    // sample < 0 => bit 1 => high value
+    int s = 127 - x;
+
+    // Descrambling: a scramble bit of 1 inverts the bit
+    if (SCRAMBLE_TABLE_RX[i >> 3] & (0x01U << (i & 7U)))
+      s = SOFT_MAX - s;
+
+    // Deinterleaving: same table as before, position = byte * 8 + bit
+    soft[INTERLEAVE_TABLE_RX[i * 2U] * 8U + INTERLEAVE_TABLE_RX[i * 2U + 1U]] = uint8_t(s);
+  }
+
+  for (uint8_t k = 0U; k < 4U; k++)
+    m_pathMetric[k] = 0;
 
   int decodeData[2U];
 
   m_mar = 0U;
-  for (i = 0; i < 660; i += 2) {
-    if (intermediate[i >> 3] & (0x80U >> (i & 7)))
-      decodeData[1U] = 1U;
-    else
-      decodeData[1U] = 0U;
-
-    if (intermediate[i >> 3] & (0x40U >> (i & 7)))
-      decodeData[0U] = 1U;
-    else
-      decodeData[0U] = 0U;
+  for (uint16_t i = 0U; i < 660U; i += 2U) {
+    decodeData[1U] = soft[i];
+    decodeData[0U] = soft[i + 1U];
 
     viterbiDecode(decodeData);
   }
 
   traceBack();
 
-  for (i = 0; i < int(DSTAR_HEADER_LENGTH_BYTES); i++)
+  for (int i = 0; i < int(DSTAR_HEADER_LENGTH_BYTES); i++)
     out[i] = 0x00U;
 
   unsigned int j = 0;
-  for (i = 329; i >= 0; i--) {
+  for (int i = 329; i >= 0; i--) {
     if (READ_BIT1(m_fecOutput, i))
       out[j >> 3] |= (0x01U << (j & 7));
 
@@ -741,19 +725,25 @@ void CDStarRX::acs(int* metric)
   m_mar++;
 }
  
-void CDStarRX::viterbiDecode(int* data)
+void CDStarRX::viterbiDecode(const int* data)
 {
   int metric[8U];
-  
-  metric[0] = (data[1] ^ 0) + (data[0] ^ 0);
-  metric[1] = (data[1] ^ 1) + (data[0] ^ 1);
-  metric[2] = (data[1] ^ 1) + (data[0] ^ 0);
-  metric[3] = (data[1] ^ 0) + (data[0] ^ 1);
-  metric[4] = (data[1] ^ 1) + (data[0] ^ 1);
-  metric[5] = (data[1] ^ 0) + (data[0] ^ 0);
-  metric[6] = (data[1] ^ 0) + (data[0] ^ 1);
-  metric[7] = (data[1] ^ 1) + (data[0] ^ 0);
-  
+
+  // Cost of an expected 0 bit = d, of an expected 1 bit = SOFT_MAX - d
+  const int d1  = data[1U];
+  const int d0  = data[0U];
+  const int d1n = SOFT_MAX - d1;
+  const int d0n = SOFT_MAX - d0;
+
+  metric[0] = d1  + d0;     // expected (0,0)
+  metric[1] = d1n + d0n;    // expected (1,1)
+  metric[2] = d1n + d0;     // expected (1,0)
+  metric[3] = d1  + d0n;    // expected (0,1)
+  metric[4] = d1n + d0n;    // expected (1,1)
+  metric[5] = d1  + d0;     // expected (0,0)
+  metric[6] = d1  + d0n;    // expected (0,1)
+  metric[7] = d1n + d0;     // expected (1,0)
+
   acs(metric);
 }
 
