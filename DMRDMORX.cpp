@@ -25,8 +25,6 @@
 #include "DMRSlotType.h"
 #include "Utils.h"
 
-const q15_t SCALING_FACTOR = 19505;      // Q15(0.60)
-
 const uint8_t MAX_SYNC_SYMBOLS_ERRS = 2U;
 const uint8_t MAX_SYNC_BYTES_ERRS   = 3U;
 
@@ -255,22 +253,21 @@ void CDMRDMORX::correlateSync(bool first)
       ptr -= DMO_BUFFER_LENGTH_SAMPLES;
 
     q31_t corr = 0;
-    q15_t min =  16000;
-    q15_t max = -16000;
+    q31_t sumL = 0;    // sum of the levels
+    q31_t sumS = 0;    // sum of the samples
 
     for (uint8_t i = 0U; i < DMR_SYNC_LENGTH_SYMBOLS; i++) {
       q15_t val = m_buffer[ptr];
-
-      if (val > max)
-        max = val;
-      if (val < min)
-        min = val;
 
       int8_t corrVal;
       if (data)
         corrVal = DMR_MS_DATA_SYNC_SYMBOLS_VALUES[i];
       else
         corrVal = DMR_MS_VOICE_SYNC_SYMBOLS_VALUES[i];
+
+      // The received samples have the opposite sign of the symbol values
+      sumL -= corrVal;
+      sumS += val;
 
       switch (corrVal) {
       case +3:
@@ -293,10 +290,21 @@ void CDMRDMORX::correlateSync(bool first)
     }
 
     if (corr > m_maxCorr) {
-      q15_t centre = (max + min) >> 1;
+      // Centre and threshold from the known sync symbols, by a least squares fit of
+      // sample = centre + gain * level over the 24 sync samples. The sync only has the
+      // outer levels (+3/-3), so the threshold, halfway between the inner (1) and outer (3)
+      // levels, is twice the gain. Unlike max/min, one noisy sample cannot skew the result.
+      // Here corr is the sum of level * sample, and sumLL is 9 * the number of symbols.
+      const int32_t n     = DMR_SYNC_LENGTH_SYMBOLS;
+      const int32_t sumLL = 9 * n;
 
-      q31_t v1 = (max - centre) * SCALING_FACTOR;
-      q15_t threshold = q15_t(v1 >> 15);
+      int32_t den = n * sumLL - sumL * sumL;
+      int32_t num = n * corr - sumL * sumS;      // the gain is num / den
+      if (den <= 0 || num <= 0)
+        return;
+
+      q15_t centre    = q15_t((int64_t(sumS) * den - int64_t(num) * sumL) / (int64_t(n) * den));
+      q15_t threshold = q15_t((2 * int64_t(num)) / den);
 
       uint8_t sync[DMR_SYNC_BYTES_LENGTH];
       uint16_t ptr = m_dataPtr + DMO_BUFFER_LENGTH_SAMPLES - DMR_SYNC_LENGTH_SAMPLES + DMR_RADIO_SYMBOL_LENGTH;
