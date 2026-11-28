@@ -236,8 +236,22 @@ const uint16_t CCITT_TABLE[] = {
 
 const uint16_t NOENDPTR = 9999U;
 
+// Fraction (in 1/256) of the amplitude of a symbol that spreads into each of its two neighbours
+// through the Gaussian filters of the transmitter and of the receiver (about 0.105)
+const int32_t ISI_FACTOR = 27;
+
+// If the header checksum fails but the Viterbi path metric says the signal looks like a header
+// (random noise gives about 45000, a clean header 33000 to 37000), the header is decoded again
+// with the sub-sample position moved by these amounts (in 1/256 samples), as the timing
+// estimate from the sync can be slightly off in noise
+const int HEADER_RETRY_METRIC = 40000;
+const int16_t HEADER_RETRY_ADJ[] = {-96, +96, -192, +192};
+
 // Soft metric: 0 = certain 0 bit, SOFT_MAX = certain 1 bit
 const int SOFT_MAX = 254;
+
+// Length of the header sample buffer
+const uint16_t HEADER_BUFFER_SAMPLES = DSTAR_FEC_SECTION_LENGTH_SAMPLES + 2U * DSTAR_RADIO_SYMBOL_LENGTH;
 
 CDStarRX::CDStarRX() :
 m_rxState(DSRXS_NONE),
@@ -263,7 +277,12 @@ m_pathMemory2(),
 m_pathMemory3(),
 m_fecOutput(),
 m_rssiAccum(0U),
-m_rssiCount(0U)
+m_rssiCount(0U),
+m_framePtr(0U),
+m_deltaPending(false),
+m_dataSynced(false),
+m_delta(0),
+m_headerMetric(0)
 {
 }
 
@@ -283,6 +302,9 @@ void CDStarRX::reset()
   m_countdown    = 0U;
   m_rssiAccum    = 0U;
   m_rssiCount    = 0U;
+  m_deltaPending = false;
+  m_dataSynced   = false;
+  m_delta        = 0;
 }
 
 void CDStarRX::samples(const q15_t* samples, const uint16_t* rssi, uint8_t length)
@@ -326,7 +348,9 @@ void CDStarRX::processNone(q15_t sample)
   // Fuzzy matching of the frame sync sequence
   bool ret = correlateFrameSync();
   if (ret) {
-    m_countdown = 5U;
+    m_countdown    = 5U;
+    m_deltaPending = true;
+    m_delta        = 0;
 
     m_headerBuffer[m_headerPtr] = sample;
     m_headerPtr++;
@@ -353,9 +377,18 @@ void CDStarRX::processNone(q15_t sample)
 
 void CDStarRX::processHeader(q15_t sample)
 {
+  // Keep looking for a better frame sync while the header is being collected. The first match
+  // can be a false one inside the alternating preamble, which looks like the start of the sync,
+  // and it would otherwise hide the real sync that follows. A better match restarts the header.
+  correlateFrameSync();
+
   if (m_countdown > 0U) {
-    correlateFrameSync();
     m_countdown--;
+  } else if (m_deltaPending) {
+    // The best sync position is now known and the sample after it is available:
+    // find the sub-sample position of the sync, used to interpolate the header and data symbols
+    m_delta        = syncDelta(m_framePtr, true);
+    m_deltaPending = false;
   }
 
   m_headerBuffer[m_headerPtr] = sample;
@@ -367,6 +400,10 @@ void CDStarRX::processHeader(q15_t sample)
     // then return true if the checksum was correct
     uint8_t header[DSTAR_HEADER_LENGTH_BYTES];
     bool ok = rxHeader(m_headerBuffer, header);
+    if (!ok && m_headerMetric < HEADER_RETRY_METRIC) {
+      for (uint8_t a = 0U; !ok && a < 4U; a++)
+        ok = rxHeader(m_headerBuffer, header, HEADER_RETRY_ADJ[a]);
+    }
     if (!ok) {
       // The checksum failed, return to looking for syncs
       m_rxState = DSRXS_NONE;
@@ -441,6 +478,12 @@ void CDStarRX::processData()
 
   // Send a data frame to the host if the required number of bits have been received
   if (m_dataPtr == m_maxSyncPtr) {
+    // A data sync was found for this frame, so update the sub-sample position
+    if (m_dataSynced) {
+      m_delta      = syncDelta(m_syncPtr, false);
+      m_dataSynced = false;
+    }
+
     uint8_t buffer[DSTAR_DATA_LENGTH_BYTES + 2U];
     samplesToBits(m_dataBuffer, m_startPtr, DSTAR_DATA_LENGTH_SYMBOLS, buffer, DSTAR_DATA_LENGTH_SAMPLES);
 
@@ -530,7 +573,11 @@ bool CDStarRX::correlateFrameSync()
 
     if (corr > m_maxFrameCorr) {
       m_maxFrameCorr = corr;
+      m_framePtr     = m_dataPtr;
       m_headerPtr    = 0U;
+      m_countdown    = 5U;
+      m_deltaPending = true;
+      m_delta        = 0;
       return true;
     }
   }
@@ -567,6 +614,7 @@ bool CDStarRX::correlateDataSync()
     if (corr > m_maxDataCorr) {
       m_maxDataCorr = corr;
       m_frameCount  = 0U;
+      m_dataSynced  = true;
 
       m_syncPtr    = m_dataPtr;
 
@@ -591,21 +639,139 @@ bool CDStarRX::correlateDataSync()
 
 void CDStarRX::samplesToBits(const q15_t* inBuffer, uint16_t start, uint16_t count, uint8_t* outBuffer, uint16_t limit)
 {
+  // Mean amplitude of the symbols, used to scale the inter-symbol interference correction
+  uint16_t ptr = start;
+  q31_t sum = 0;
   for (uint16_t i = 0U; i < count; i++) {
-    q15_t sample = inBuffer[start];
+    q31_t s = sampleAt(inBuffer, ptr, m_delta, limit);
+    sum += (s < 0) ? -s : s;
 
-    if (sample < 0)
+    ptr += DSTAR_RADIO_SYMBOL_LENGTH;
+    if (ptr >= limit)
+      ptr -= limit;
+  }
+  q31_t isi = ((sum / count) * ISI_FACTOR) >> 8;
+
+  // Each symbol picks up a fraction of its two neighbours (the Gaussian filters spread
+  // each symbol over its neighbours). The hard decision of the neighbours is used to remove it.
+  q31_t prev = 0, cur = 0, next = 0;
+  ptr = start;
+  cur = sampleAt(inBuffer, ptr, m_delta, limit);
+  for (uint16_t i = 0U; i < count; i++) {
+    uint16_t nptr = ptr + DSTAR_RADIO_SYMBOL_LENGTH;
+    if (nptr >= limit)
+      nptr -= limit;
+    next = (i + 1U < count) ? sampleAt(inBuffer, nptr, m_delta, limit) : cur;
+
+    q31_t v = cur;
+    if (i > 0U && i + 1U < count) {
+      q31_t n = ((prev < 0) ? -1 : 1) + ((next < 0) ? -1 : 1);
+      v -= n * isi;
+    }
+
+    if (v < 0)
       WRITE_BIT2(outBuffer, i, true);
     else
       WRITE_BIT2(outBuffer, i, false);
 
-    start += DSTAR_RADIO_SYMBOL_LENGTH;
-    if (start >= limit)
-      start -= limit;
+    prev = cur;
+    cur  = next;
+    ptr  = nptr;
   }
 }
 
-bool CDStarRX::rxHeader(const q15_t* in, uint8_t* out)
+// Value of the waveform at buffer position pos + delta/256 samples (|delta| <= 128),
+// by quadratic (3 point Lagrange) interpolation. delta == 0 returns the stored sample.
+q15_t CDStarRX::sampleAt(const q15_t* inBuffer, uint16_t pos, int16_t delta, uint16_t limit) const
+{
+  if (delta == 0)
+    return inBuffer[pos];
+
+  uint16_t prev = (pos == 0U) ? limit - 1U : pos - 1U;
+  uint16_t next = (pos + 1U >= limit) ? 0U : pos + 1U;
+
+  q31_t s0 = inBuffer[pos];
+  q31_t sm = inBuffer[prev];
+  q31_t sp = inBuffer[next];
+
+  q31_t d = delta;
+  q31_t v = s0 + ((d * (sp - sm)) >> 9) + (((d * d) * (sp - 2 * s0 + sm)) >> 17);
+
+  if (v > 32767)
+    v = 32767;
+  if (v < -32768)
+    v = -32768;
+
+  return q15_t(v);
+}
+
+// Sub-sample position (1/256 sample units, -128..+128) of the correlation peak of the frame
+// or data sync, relative to the sample 'end' (its last symbol), from a parabola through
+// the correlation at -1, 0 and +1 samples.
+int16_t CDStarRX::syncDelta(uint16_t end, bool frame) const
+{
+  const bool*    symbols = frame ? DSTAR_FRAME_SYNC_SYMBOLS : DSTAR_DATA_SYNC_SYMBOLS;
+  const uint16_t length  = frame ? DSTAR_FRAME_SYNC_LENGTH_SYMBOLS : DSTAR_DATA_SYNC_LENGTH_SYMBOLS;
+  const uint16_t samples = length * DSTAR_RADIO_SYMBOL_LENGTH;
+
+  q31_t c[3U];
+  for (uint8_t d = 0U; d < 3U; d++) {
+    uint16_t ptr = (end + 2U * DSTAR_DATA_LENGTH_SAMPLES - samples + DSTAR_RADIO_SYMBOL_LENGTH + d - 1U) % DSTAR_DATA_LENGTH_SAMPLES;
+
+    q31_t corr = 0;
+    for (uint8_t i = 0U; i < length; i++) {
+      q15_t val = m_dataBuffer[ptr];
+
+      if (symbols[i])
+        corr -= val;
+      else
+        corr += val;
+
+      ptr += DSTAR_RADIO_SYMBOL_LENGTH;
+      if (ptr >= DSTAR_DATA_LENGTH_SAMPLES)
+        ptr -= DSTAR_DATA_LENGTH_SAMPLES;
+    }
+
+    c[d] = corr;
+  }
+
+  // Not a clear peak, don't interpolate
+  q31_t den = c[0U] - 2 * c[1U] + c[2U];
+  if (c[1U] < c[0U] || c[1U] < c[2U] || den >= 0)
+    return 0;
+
+  q31_t p = ((c[0U] - c[2U]) << 7) / den;
+  if (p > 128)
+    p = 128;
+  if (p < -128)
+    p = -128;
+
+  return int16_t(p);
+}
+
+// Header sample at position pos, with the sub-sample position moved by adj/256 samples
+q15_t CDStarRX::headerSample(const q15_t* in, int32_t pos, int16_t adj) const
+{
+  int32_t total = int32_t(m_delta) + adj;
+  int32_t shift = 0;
+  if (total > 128) {
+    shift = 1;
+    total -= 256;
+  } else if (total < -128) {
+    shift = -1;
+    total += 256;
+  }
+
+  pos += shift;
+  if (pos < 1)
+    pos = 1;
+  if (pos > int32_t(HEADER_BUFFER_SAMPLES) - 2)
+    pos = HEADER_BUFFER_SAMPLES - 2;
+
+  return sampleAt(in, uint16_t(pos), int16_t(total), HEADER_BUFFER_SAMPLES);
+}
+
+bool CDStarRX::rxHeader(const q15_t* in, uint8_t* out, int16_t adj)
 {
   // The first header symbol is at sample DSTAR_RADIO_SYMBOL_LENGTH
   const uint16_t FIRST = DSTAR_RADIO_SYMBOL_LENGTH;
@@ -613,7 +779,7 @@ bool CDStarRX::rxHeader(const q15_t* in, uint8_t* out)
   // Mean symbol amplitude, used to normalise the soft values
   uint32_t sum = 0U;
   for (uint16_t i = 0U; i < 660U; i++) {
-    int32_t s = in[FIRST + i * DSTAR_RADIO_SYMBOL_LENGTH];
+    int32_t s = headerSample(in, FIRST + i * DSTAR_RADIO_SYMBOL_LENGTH, adj);
     sum += (s < 0) ? -s : s;
   }
 
@@ -630,7 +796,15 @@ bool CDStarRX::rxHeader(const q15_t* in, uint8_t* out)
   for (uint16_t i = 0U; i < 660U; i++) {
     // 85/amp: a symbol as large as the mean maps to 85, saturating at 1.5 times the mean.
     // This scaling is a starting point: try others (e.g. 127/amp).
-    int32_t x = (int32_t(in[FIRST + i * DSTAR_RADIO_SYMBOL_LENGTH]) * 85) / amp;
+    uint16_t pos = FIRST + i * DSTAR_RADIO_SYMBOL_LENGTH;
+    int32_t cur  = headerSample(in, pos, adj);
+    int32_t prv  = headerSample(in, pos - DSTAR_RADIO_SYMBOL_LENGTH, adj);
+    int32_t nxt  = headerSample(in, pos + DSTAR_RADIO_SYMBOL_LENGTH, adj);
+
+    // Remove the part of the neighbouring symbols that spreads into this one
+    cur -= (((prv < 0) ? -1 : 1) + ((nxt < 0) ? -1 : 1)) * ((amp * ISI_FACTOR) >> 8);
+
+    int32_t x = (cur * 85) / amp;
     if (x > 127)
       x = 127;
     if (x < -127)
@@ -661,6 +835,8 @@ bool CDStarRX::rxHeader(const q15_t* in, uint8_t* out)
   }
 
   traceBack();
+  if (adj == 0)
+    m_headerMetric = m_pathMetric[0U];
 
   for (int i = 0; i < int(DSTAR_HEADER_LENGTH_BYTES); i++)
     out[i] = 0x00U;

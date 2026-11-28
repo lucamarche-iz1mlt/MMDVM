@@ -64,6 +64,11 @@ private:
   uint8_t      m_fecOutput[42U];
   uint32_t     m_rssiAccum;
   uint16_t     m_rssiCount;
+  uint16_t     m_framePtr;
+  bool         m_deltaPending;
+  bool         m_dataSynced;
+  int16_t      m_delta;
+  int          m_headerMetric;
   
   void    processNone(q15_t sample);
   void    processHeader(q15_t sample);
@@ -71,9 +76,12 @@ private:
   bool    correlateFrameSync();
   bool    correlateDataSync();
   void    samplesToBits(const q15_t* inBuffer, uint16_t start, uint16_t count, uint8_t* outBuffer, uint16_t limit);
+  q15_t   sampleAt(const q15_t* inBuffer, uint16_t pos, int16_t delta, uint16_t limit) const;
+  int16_t syncDelta(uint16_t end, bool frame) const;
   void    writeRSSIHeader(unsigned char* header);
   void    writeRSSIData(unsigned char* data);
-  bool    rxHeader(const q15_t* in, uint8_t* out);
+  bool    rxHeader(const q15_t* in, uint8_t* out, int16_t adj = 0);
+  q15_t   headerSample(const q15_t* in, int32_t pos, int16_t adj) const;
   void    acs(int* metric);
   void    viterbiDecode(const int* data);
   void    traceBack();
